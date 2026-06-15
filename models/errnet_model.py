@@ -192,6 +192,9 @@ class ERRNetModel(ERRNetBase):
         self.epoch = 0
         self.iterations = 0
         self.device = torch.device("cpu")
+        # Multi-Step Loss configuration
+        self.multi_step = False  # 是否启用 Multi-Step Loss
+        self.num_steps = 2       # 迭代步数
 
     def print_network(self):
         print('--------------------- Model ---------------------')
@@ -211,6 +214,12 @@ class ERRNetModel(ERRNetBase):
         BaseModel.initialize(self, opt)
         self.device = torch.device("cuda:%d" % self.gpu_ids[0] if len(self.gpu_ids) > 0 else "cpu")
 
+        # Multi-Step Loss configuration (可通过 opt 传入，默认关闭)
+        if hasattr(opt, 'multi_step'):
+            self.multi_step = opt.multi_step
+        if hasattr(opt, 'num_steps'):
+            self.num_steps = opt.num_steps
+
         in_channels = 3
         self.vgg = None
         
@@ -218,7 +227,11 @@ class ERRNetModel(ERRNetBase):
             self.vgg = losses.Vgg19(requires_grad=False).to(self.device)
             in_channels += 1472
         
-        self.net_i = arch.__dict__[self.opt.inet](in_channels, 3).to(self.device)
+        self.net_i = arch.__dict__[self.opt.inet](in_channels, 3)
+        if len(self.gpu_ids) > 1:
+            self.net_i = nn.DataParallel(self.net_i, device_ids=self.gpu_ids)
+
+        self.net_i = self.net_i.to(self.device)
         networks.init_weights(self.net_i, init_type=opt.init_type) # using default initialization as EDSR
         self.edge_map = EdgeMap(scale=1).to(self.device)
 
@@ -246,6 +259,9 @@ class ERRNetModel(ERRNetBase):
             # Define discriminator
             # if self.opt.lambda_gan > 0:
             self.netD = networks.define_D(opt, 3)
+            if len(self.gpu_ids) > 1:
+                self.netD = nn.DataParallel(self.netD, device_ids=self.gpu_ids)
+                self.netD = self.netD.to(self.device)
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(),
                                             lr=opt.lr, betas=(0.9, 0.999))
             self._init_optimizer([self.optimizer_D])
@@ -271,6 +287,8 @@ class ERRNetModel(ERRNetBase):
 
         (self.loss_D*self.opt.lambda_gan).backward(retain_graph=True)
 
+    # ========== ORIGINAL backward_G (保留备用) ==========
+    """
     def backward_G(self):
         # Make it a tiny bit faster
         for p in self.netD.parameters():
@@ -281,6 +299,8 @@ class ERRNetModel(ERRNetBase):
         self.loss_icnn_pixel = None
         self.loss_icnn_vgg = None
         self.loss_G_GAN = None
+        # self.loss_icnn_ssim = None
+        # self.loss_icnn_charb = None
 
         if self.opt.lambda_gan > 0:
             self.loss_G_GAN = self.loss_dic['gan'].get_g_loss(
@@ -293,6 +313,12 @@ class ERRNetModel(ERRNetBase):
             
             self.loss_icnn_vgg = self.loss_dic['t_vgg'].get_loss(
                 self.output_i, self.target_t)
+            
+            # self.loss_icnn_ssim = self.loss_dic['t_ssim'].get_loss(
+            #     self.output_i, self.target_t)
+            
+            # self.loss_icnn_charb = self.loss_dic['t_charb'].get_loss(
+            #     self.output_i, self.target_t)
 
             self.loss_G += self.loss_icnn_pixel+self.loss_icnn_vgg*self.opt.lambda_vgg
         else:
@@ -301,14 +327,111 @@ class ERRNetModel(ERRNetBase):
             self.loss_G += self.loss_CX
         
         self.loss_G.backward()
+    """
 
-    def forward(self):
-        # without edge
-        input_i = self.input
+    # ========== NEW Multi-Step backward_G ==========
+    def backward_G(self):
+        # Make it a tiny bit faster
+        for p in self.netD.parameters():
+            p.requires_grad = False
+        
+        self.loss_G = 0
+        self.loss_CX = None
+        self.loss_icnn_pixel = None
+        self.loss_icnn_vgg = None
+        self.loss_G_GAN = None
+        
+        # 保存原始输入，用于多步迭代
+        original_input = self.input
+        original_target = self.target_t
+        
+        # 判断是否启用 Multi-Step Loss
+        if self.multi_step and self.aligned:
+            # Multi-Step Training
+            current_input = original_input
+            total_loss = 0
+            
+            # 第一步：使用原始输入
+            # 保存当前 output_i 用于后续可视化
+            self.forward()
+            step_output = self.output_i
+            
+            # 计算第一步的损失
+            if self.aligned:
+                step_pixel_loss = self.loss_dic['t_pixel'].get_loss(step_output, original_target)
+                step_vgg_loss = self.loss_dic['t_vgg'].get_loss(step_output, original_target)
+                step_loss = step_pixel_loss + step_vgg_loss * self.opt.lambda_vgg
+                total_loss = total_loss + step_loss
+            
+            # 后续迭代步数
+            for step in range(1, self.num_steps):
+                # 使用上一步的输出作为新的输入
+                current_input = step_output.detach()  # detach 停止梯度传播到前一步
+                
+                # 重新计算 hypercolumn（如果需要）
+                if self.vgg is not None:
+                    hypercolumn = self.vgg(current_input)
+                    _, C, H, W = current_input.shape
+                    hypercolumn = [F.interpolate(feature.detach(), size=(H, W), mode='bilinear', align_corners=False) for feature in hypercolumn]
+                    input_i = [current_input]
+                    input_i.extend(hypercolumn)
+                    input_i = torch.cat(input_i, dim=1)
+                else:
+                    input_i = current_input
+                
+                # 前向传播
+                step_output = self.net_i(input_i)
+                
+                # 计算损失
+                if self.aligned:
+                    step_pixel_loss = self.loss_dic['t_pixel'].get_loss(step_output, original_target)
+                    step_vgg_loss = self.loss_dic['t_vgg'].get_loss(step_output, original_target)
+                    step_loss = step_pixel_loss + step_vgg_loss * self.opt.lambda_vgg
+                    total_loss = total_loss + step_loss
+            
+            # 更新最终输出（用于可视化）
+            self.output_i = step_output
+            
+            # 存储各步损失用于日志（可选）
+            self.loss_icnn_pixel = step_pixel_loss
+            self.loss_icnn_vgg = step_vgg_loss
+            self.multi_step_total_loss = total_loss
+            
+            # GAN Loss（如果启用）
+            if self.opt.lambda_gan > 0:
+                self.loss_G_GAN = self.loss_dic['gan'].get_g_loss(
+                    self.netD, self.input, self.output_i, self.target_t)
+                total_loss = total_loss + self.loss_G_GAN * self.opt.lambda_gan
+            
+            self.loss_G = total_loss
+            self.loss_G.backward()
+            
+        else:
+            # ====== ORIGINAL backward logic (single step) ======
+            if self.opt.lambda_gan > 0:
+                self.loss_G_GAN = self.loss_dic['gan'].get_g_loss(
+                    self.netD, self.input, self.output_i, self.target_t)
+                self.loss_G += self.loss_G_GAN * self.opt.lambda_gan
+            
+            if self.aligned:
+                self.loss_icnn_pixel = self.loss_dic['t_pixel'].get_loss(
+                    self.output_i, self.target_t)
+                self.loss_icnn_vgg = self.loss_dic['t_vgg'].get_loss(
+                    self.output_i, self.target_t)
+                self.loss_G += self.loss_icnn_pixel + self.loss_icnn_vgg * self.opt.lambda_vgg
+            else:
+                self.loss_CX = self.loss_dic['t_cx'].get_loss(self.output_i, self.target_t)
+                self.loss_G += self.loss_CX
+            
+            self.loss_G.backward()
+
+    def forward(self, input_override=None):
+        # 如果提供了 input_override，则使用它；否则使用 self.input
+        input_i = input_override if input_override is not None else self.input
 
         if self.vgg is not None:
-            hypercolumn = self.vgg(self.input)
-            _, C, H, W = self.input.shape
+            hypercolumn = self.vgg(input_i)
+            _, C, H, W = input_i.shape
             hypercolumn = [F.interpolate(feature.detach(), size=(H, W), mode='bilinear', align_corners=False) for feature in hypercolumn]
             input_i = [input_i]
             input_i.extend(hypercolumn)
@@ -316,10 +439,14 @@ class ERRNetModel(ERRNetBase):
 
         output_i = self.net_i(input_i)
 
-        self.output_i = output_i
+        # 只有在没有 input_override 时才更新 self.output_i
+        if input_override is None:
+            self.output_i = output_i
 
         return output_i
         
+    # ========== ORIGINAL optimize_parameters (保留备用) ==========
+    """
     def optimize_parameters(self):
         self._train()
         self.forward()
@@ -332,6 +459,38 @@ class ERRNetModel(ERRNetBase):
         self.optimizer_G.zero_grad()
         self.backward_G()
         self.optimizer_G.step()
+    """
+
+    # ========== NEW optimize_parameters ==========
+    def optimize_parameters(self):
+        self._train()
+        
+        # Multi-Step 模式下的前向传播（在 backward_G 内部处理迭代）
+        # 注意：Multi-Step 模式下第一次 forward 会在 backward_G 内部调用
+        if self.multi_step and self.aligned:
+            # 先执行一次标准 forward 以保留 output_i 用于判别器
+            self.forward()
+            
+            if self.opt.lambda_gan > 0:
+                self.optimizer_D.zero_grad()
+                self.backward_D()
+                self.optimizer_D.step()
+            
+            self.optimizer_G.zero_grad()
+            self.backward_G()  # Multi-Step backward 内部包含迭代 forward
+            self.optimizer_G.step()
+        else:
+            # 原始单步训练
+            self.forward()
+            
+            if self.opt.lambda_gan > 0:
+                self.optimizer_D.zero_grad()
+                self.backward_D()
+                self.optimizer_D.step()
+            
+            self.optimizer_G.zero_grad()
+            self.backward_G()
+            self.optimizer_G.step()
         
     def get_current_errors(self):
         ret_errors = OrderedDict()
@@ -339,6 +498,9 @@ class ERRNetModel(ERRNetBase):
             ret_errors['IPixel'] = self.loss_icnn_pixel.item()
         if self.loss_icnn_vgg is not None:
             ret_errors['VGG'] = self.loss_icnn_vgg.item()
+        # Multi-Step 额外信息
+        if self.multi_step and hasattr(self, 'multi_step_total_loss'):
+            ret_errors['MultiStep'] = self.multi_step_total_loss.item()
             
         if self.opt.lambda_gan > 0 and self.loss_G_GAN is not None:
             ret_errors['G'] = self.loss_G_GAN.item()
@@ -363,28 +525,43 @@ class ERRNetModel(ERRNetBase):
         icnn_path = model.opt.icnn_path
         state_dict = None
 
+        # 定义一个函数来去除 'module.' 前缀
+        def remove_module_prefix(state_dict):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            return new_state_dict
+
         if icnn_path is None:
             model_path = util.get_model_list(model.save_dir, model.name(), epoch=resume_epoch)
             state_dict = _torch_load_compat(model_path)
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
-            model.net_i.load_state_dict(state_dict['icnn'])
+            # 处理 module. 前缀
+            icnn_state = remove_module_prefix(state_dict['icnn'])
+            model.net_i.load_state_dict(icnn_state)
             if model.isTrain:
                 model.optimizer_G.load_state_dict(state_dict['opt_g'])
         else:
             state_dict = _torch_load_compat(icnn_path, map_location=torch.device('cpu'))
-            model.net_i.load_state_dict(state_dict['icnn'])
+            # 处理 module. 前缀
+            icnn_state = remove_module_prefix(state_dict['icnn'])
+            model.net_i.load_state_dict(icnn_state)
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
-            # if model.isTrain:
-            #     model.optimizer_G.load_state_dict(state_dict['opt_g'])
 
         if model.isTrain:
             if 'netD' in state_dict:
                 print('Resume netD ...')
-                model.netD.load_state_dict(state_dict['netD'])
+                netd_state = remove_module_prefix(state_dict['netD'])
+                model.netD.load_state_dict(netd_state)
                 model.optimizer_D.load_state_dict(state_dict['opt_d'])
-            
+            else:
+                print('[!] Warning: No discriminator found in checkpoint')
+
         print('Resume from epoch %d, iteration %d' % (model.epoch, model.iterations))
         return state_dict
 
@@ -459,6 +636,9 @@ class NetworkWrapper(ERRNetBase):
             # define discriminator
             # if self.opt.lambda_gan > 0:
             self.netD = networks.define_D(opt, 3)
+            if len(self.gpu_ids) > 1:
+                self.netD = nn.DataParallel(self.netD, device_ids=self.gpu_ids)
+                self.netD = self.netD.to(self.device)
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(),
                                             lr=opt.lr, betas=(opt.beta1, 0.999))
             self._init_optimizer([self.optimizer_D])

@@ -31,11 +31,22 @@ datadir = './datasets/processed_data'
 datadir_syn = join(datadir, 'VOCdevkit/VOC2012/PNGImages')
 datadir_real = join(datadir, 'real_train')
 
+# ========== 原代码（已注释，保留备用） ==========
+# train_dataset = datasets.CEILDataset(
+#     datadir_syn, read_fns('VOC2012_224_train_png.txt'), size=opt.max_dataset_size, enable_transforms=True, 
+#     low_sigma=opt.low_sigma, high_sigma=opt.high_sigma,
+#     low_gamma=opt.low_gamma, high_gamma=opt.high_gamma)
+# ================================================
+
+# ========== 新代码：启用颜色抖动增强 ==========
 train_dataset = datasets.CEILDataset(
     datadir_syn, read_fns('VOC2012_224_train_png.txt'), size=opt.max_dataset_size, enable_transforms=True, 
     low_sigma=opt.low_sigma, high_sigma=opt.high_sigma,
-    low_gamma=opt.low_gamma, high_gamma=opt.high_gamma)
+    low_gamma=opt.low_gamma, high_gamma=opt.high_gamma,
+    enable_color_jitter=True)  # 启用颜色抖动
+# ==============================================
 
+# ========== 原代码（保持不变） ==========
 train_dataset_real = datasets.CEILTestDataset(datadir_real, enable_transforms=True)
 
 train_dataset_fusion = datasets.FusionDataset([train_dataset, train_dataset_real], [0.7, 0.3])
@@ -74,21 +85,31 @@ if opt.resume:
 # define training strategy 
 engine.model.opt.lambda_gan = 0
 # engine.model.opt.lambda_gan = 0.01
-set_learning_rate(1e-4)
+set_learning_rate(8e-5)
 while engine.epoch < 60:
     if engine.epoch == 20:
         engine.model.opt.lambda_gan = 0.01 # gan loss is added after epoch 20
     if engine.epoch == 30:
-        set_learning_rate(5e-5)
+        set_learning_rate(4e-5)
     if engine.epoch == 40:
-        set_learning_rate(1e-5)
+        set_learning_rate(2e-5)
+        engine.model.opt.lambda_gan = 0.01
     if engine.epoch == 45:
         ratio = [0.5, 0.5]
         print('[i] adjust fusion ratio to {}'.format(ratio))
         train_dataset_fusion.fusion_ratios = ratio
-        set_learning_rate(5e-5)
+        set_learning_rate(1e-5)
     if engine.epoch == 50:
         set_learning_rate(1e-5)
+    if engine.epoch == 60 or engine.epoch == 61 or engine.epoch == 59:
+        set_learning_rate(1e-5)
+        ratio = [0.5, 0.5]
+        print('[i] adjust fusion ratio to {}'.format(ratio))
+        train_dataset_fusion.fusion_ratios = ratio
+        engine.model.opt.lambda_gan = 0.01
+    if engine.epoch == 83 or engine.epoch == 84:
+        set_learning_rate(1e-5)
+        engine.model.opt.lambda_gan = 0.01
 
     engine.train(train_dataloader_fusion)
     

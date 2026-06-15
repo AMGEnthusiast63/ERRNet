@@ -10,6 +10,7 @@ import util.util as util
 from models.vgg import Vgg19
 from torch.autograd import Function
 from models.CX import CX_loss
+from pytorch_msssim import SSIM
 
 ###############################################################################
 # Functions
@@ -31,6 +32,26 @@ class GradientLoss(nn.Module):
         
         return self.loss(predict_gradx, target_gradx) + self.loss(predict_grady, target_grady)
 
+class SSIMLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ssim = SSIM(
+            data_range=1.0,
+            size_average=True,
+            channel=3
+        )
+
+    def forward(self, pred, target):
+        return 1.0 - self.ssim(pred, target)
+
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
 
 class MultipleLoss(nn.Module):
     def __init__(self, losses, weight=None):
@@ -254,11 +275,35 @@ def init_loss(opt, tensor):
 
     loss_dic = {}
 
+    # ========== 原代码（已注释，保留备用） ==========
+    # pixel_loss = ContentLoss()
+    # pixel_loss.initialize(MultipleLoss([nn.MSELoss(), GradientLoss()], [0.2,0.4]))
+    # ===============================================
+
+    # ========== 改进后的损失函数（MSE + Gradient + SSIM + Charbonnier） ==========
     pixel_loss = ContentLoss()
-    pixel_loss.initialize(MultipleLoss([nn.MSELoss(), GradientLoss()], [0.2,0.4]))
+    pixel_loss.initialize(MultipleLoss(
+        [nn.MSELoss(), GradientLoss(), SSIMLoss(), CharbonnierLoss()], 
+        [0.2, 0.3, 0.3, 0.2]  # 权重：MSE 0.2, Gradient 0.3, SSIM 0.3, Charbonnier 0.2
+    ))
+    # ===========================================================================
 
     loss_dic['t_pixel'] = pixel_loss
+    
+    # ========== 原代码（已注释，SSIM和Charbonnier现在已集成到pixel_loss中） ==========
+    # ssim_loss = ContentLoss()
+    # ssim_loss.initialize(SSIMLoss())
+    # loss_dic['t_ssim'] = ssim_loss
+    # =================================================================================
+    
     loss_dic['r_pixel'] = pixel_loss
+    
+    # ========== 原代码（已注释） ==========
+    # charb_loss = ContentLoss()
+    # charb_loss.initialize(CharbonnierLoss())
+    # loss_dic['t_charb'] = charb_loss
+    # loss_dic['r_charb'] = charb_loss
+    # =====================================
 
     if opt.lambda_gan > 0:
         if opt.gan_type == 'sgan' or opt.gan_type == 'gan':

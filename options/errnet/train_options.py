@@ -5,11 +5,11 @@ class TrainOptions(BaseOptions):
     def initialize(self):
         BaseOptions.initialize(self)        
         # for displays
-        self.parser.add_argument('--display_freq', type=int, default=100, help='frequency of showing training results on screen')        
-        self.parser.add_argument('--update_html_freq', type=int, default=1000, help='frequency of saving training results to html')
-        self.parser.add_argument('--print_freq', type=int, default=100, help='frequency of showing training results on console')
+        self.parser.add_argument('--display_freq', type=int, default=10, help='frequency of showing training results on screen')        
+        self.parser.add_argument('--update_html_freq', type=int, default=10, help='frequency of saving training results to html')
+        self.parser.add_argument('--print_freq', type=int, default=10, help='frequency of showing training results on console')
         self.parser.add_argument('--no_html', action='store_true', help='do not save intermediate training results to [opt.checkpoints_dir]/[opt.name]/web/')
-        self.parser.add_argument('--save_epoch_freq', type=int, default=10, help='frequency of saving checkpoints at the end of epochs')
+        self.parser.add_argument('--save_epoch_freq', type=int, default=5, help='frequency of saving checkpoints at the end of epochs')
         self.parser.add_argument('--debug', action='store_true', help='only do one epoch and displays at each iteration')
 
         # for training (Note: in train_errnet.py, we mannually tune the training protocol, but you can also use following setting by modifying the code in errnet_model.py)
@@ -21,7 +21,8 @@ class TrainOptions(BaseOptions):
         self.parser.add_argument('--high_sigma', type=float, default=5, help='max sigma in synthetic dataset')
         self.parser.add_argument('--low_gamma', type=float, default=1.3, help='max gamma in synthetic dataset')
         self.parser.add_argument('--high_gamma', type=float, default=1.3, help='max gamma in synthetic dataset')
-        
+        self.parser.add_argument('--multi_step', action='store_true', help='enable multi-step loss')
+        self.parser.add_argument('--num_steps', type=int, default=2, help='number of iterative steps for multi-step loss')
         # data augmentation
         self.parser.add_argument('--batchSize', '-b', type=int, default=1, help='input batch size')
         self.parser.add_argument('--loadSize', type=str, default='224,336,448', help='scale images to multiple size')
@@ -39,5 +40,7 @@ class TrainOptions(BaseOptions):
         
         self.parser.add_argument('--lambda_gan', type=float, default=0.01, help='weight for gan loss')
         self.parser.add_argument('--lambda_vgg', type=float, default=0.1, help='weight for vgg loss')
+        
+        # --inet 参数在 base_options.py 中定义，这里不需要重复定义
         
         self.isTrain = True

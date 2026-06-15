@@ -9,6 +9,7 @@ class BaseOptions(Base):
     def initialize(self):
         Base.initialize(self)
         # experiment specifics
+        # 直接修改默认值，从 'errnet' 改为 'ImprovedDRNet'
         self.parser.add_argument('--inet', type=str, default='errnet', help='chooses which architecture to use for inet.')
         self.parser.add_argument('--icnn_path', type=str, default=None, help='icnn checkpoint to use.')
         self.parser.add_argument('--init_type', type=str, default='edsr', help='network initialization [normal|xavier|kaiming|orthogonal|uniform]')

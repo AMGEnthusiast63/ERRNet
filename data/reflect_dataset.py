@@ -6,6 +6,7 @@ from PIL import Image
 import random
 import torch
 import math
+import numpy as np
 
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
@@ -40,8 +41,9 @@ def __scale_width(img, target_width):
         return img
     w = target_width
     h = int(target_width * oh / ow)
-    h = math.ceil(h / 2.) * 2  # round up to even
+    h = math.ceil(h / 2.) * 2
     return img.resize((w, h), Image.BICUBIC)
+
 
 def __scale_height(img, target_height):
     ow, oh = img.size
@@ -49,7 +51,7 @@ def __scale_height(img, target_height):
         return img
     h = target_height
     w = int(target_height * ow / oh)
-    w = math.ceil(w / 2.) * 2  # round up to even
+    w = math.ceil(w / 2.) * 2
     return img.resize((w, h), Image.BICUBIC)
 
 
@@ -64,9 +66,7 @@ def paired_data_transforms(img_1, img_2, unaligned_transforms=False):
         j = random.randint(0, w - tw)
         return i, j, th, tw
     
-    # target_size = int(random.randint(224+10, 448) / 2.) * 2
     target_size = int(random.randint(224, 448) / 2.) * 2
-    # target_size = int(random.randint(256, 480) / 2.) * 2
     ow, oh = img_1.size
     if ow >= oh:
         img_1 = __scale_height(img_1, target_size)
@@ -80,11 +80,9 @@ def paired_data_transforms(img_1, img_2, unaligned_transforms=False):
         img_2 = F.hflip(img_2)
 
     i, j, h, w = get_params(img_1, (224,224))
-    # i, j, h, w = get_params(img_1, (256,256))
     img_1 = F.crop(img_1, i, j, h, w)
     
     if unaligned_transforms:
-        # print('random shift')
         i_shift = random.randint(-10, 10)
         j_shift = random.randint(-10, 10)
         i += i_shift
@@ -92,7 +90,32 @@ def paired_data_transforms(img_1, img_2, unaligned_transforms=False):
 
     img_2 = F.crop(img_2, i, j, h, w)
     
-    return img_1,img_2
+    return img_1, img_2
+
+
+# ========== 颜色抖动函数（支持 float32 numpy array） ==========
+def apply_color_jitter(img, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05):
+    """对图像应用颜色抖动增强（支持 PIL Image 和 numpy array）"""
+    if random.random() < 0.5:
+        color_jitter = transforms.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue
+        )
+        if isinstance(img, np.ndarray):
+            # 确保数据范围在 [0, 255] 且类型为 uint8
+            if img.dtype == np.float32 or img.dtype == np.float64:
+                img_uint8 = (img * 255).astype(np.uint8)
+            else:
+                img_uint8 = img.astype(np.uint8)
+            img_pil = Image.fromarray(img_uint8)
+            img_pil = color_jitter(img_pil)
+            img = np.array(img_pil).astype(np.float32) / 255.0
+        else:
+            img = color_jitter(img)
+    return img
+# ================================================================
 
 
 BaseDataset = torchdata.Dataset
@@ -110,11 +133,14 @@ class DataLoader(torch.utils.data.DataLoader):
 
 
 class CEILDataset(BaseDataset):
-    def __init__(self, datadir, fns=None, size=None, enable_transforms=True, low_sigma=2, high_sigma=5, low_gamma=1.3, high_gamma=1.3):
+    def __init__(self, datadir, fns=None, size=None, enable_transforms=True, 
+                 low_sigma=2, high_sigma=5, low_gamma=1.3, high_gamma=1.3,
+                 enable_color_jitter=False):
         super(CEILDataset, self).__init__()
         self.size = size
         self.datadir = datadir
         self.enable_transforms = enable_transforms
+        self.enable_color_jitter = enable_color_jitter
 
         sortkey = lambda key: os.path.split(key)[-1]
         self.paths = sorted(make_dataset(datadir, fns), key=sortkey)
@@ -136,6 +162,9 @@ class CEILDataset(BaseDataset):
             t_img, r_img = paired_data_transforms(t_img, r_img)
         syn_model = self.syn_model
         t_img, r_img, m_img = syn_model(t_img, r_img)
+        
+        if self.enable_color_jitter:
+            m_img = apply_color_jitter(m_img)
         
         B = to_tensor(t_img)
         R = to_tensor(r_img)
@@ -195,7 +224,7 @@ class CEILTestDataset(BaseDataset):
         B = to_tensor(t_img)
         M = to_tensor(m_img)
 
-        dic =  {'input': M, 'target_t': B, 'fn': fn, 'real': True, 'unaligned': False, 'target_r': B} # fake reflection gt 
+        dic = {'input': M, 'target_t': B, 'fn': fn, 'real': True, 'unaligned': False, 'target_r': B}
         if self.flag is not None:
             dic.update(self.flag)
         return dic
@@ -264,7 +293,6 @@ class PairedCEILDataset(CEILDataset):
         B, R, M = self.data_synthesis(t_img, r_img)
 
         data = {'input': M, 'target_t': B, 'target_r': R, 'fn': fn, 'real': False, 'unaligned': False}
-        # return M, B
         return data
 
     def __len__(self):
@@ -290,7 +318,7 @@ class FusionDataset(BaseDataset):
         for i, ratio in enumerate(self.fusion_ratios):
             if random.random() < ratio/residual or i == len(self.fusion_ratios) - 1:
                 dataset = self.datasets[i]
-                return dataset[index%len(dataset)]
+                return dataset[index % len(dataset)]
             residual -= ratio
     
     def __len__(self):
@@ -300,16 +328,14 @@ class FusionDataset(BaseDataset):
 class RepeatedDataset(BaseDataset):
     def __init__(self, dataset, repeat=1):
         self.dataset = dataset
-        self.size = len(dataset) * repeat        
-        # self.reset()
+        self.size = len(dataset) * repeat
 
     def reset(self):
-        
         self.dataset.reset()
 
     def __getitem__(self, index):
         dataset = self.dataset
-        return dataset[index%len(dataset)]
+        return dataset[index % len(dataset)]
     
     def __len__(self):
         return self.size

@@ -40,10 +40,12 @@ def set_learning_rate(lr):
 
 
 set_learning_rate(1e-4)
-while engine.epoch < 80:
-    if engine.epoch == 65:
-        set_learning_rate(5e-5)
+while engine.epoch < 105:
     if engine.epoch == 70:
+        set_learning_rate(5e-5)
+    if engine.epoch == 75:
+        set_learning_rate(1e-5)
+    if engine.epoch == 84 or engine.epoch == 85 or engine.epoch == 86:
         set_learning_rate(1e-5)
         
     engine.train(train_dataloader_fusion)
